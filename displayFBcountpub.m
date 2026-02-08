@@ -1,70 +1,73 @@
-%% plot_particle_retention_loading_flush_cycles_lines.m
-% Publication-oriented visualization of nanoparticle retention across
-% repeated loading–flush cycles (trajectory + mean band; no bars).
+%% plot_particle_retention_loading_flush_cycles_variability_evolution.m
+% Variability-first + evolution line (ROBUST): connect MEDIANS across cycles.
+% No spaghetti trajectories.
 %
-% Plot:
-%   - Two conditions: IDEs vs MR
-%   - Cycles: 1..5
-%   - Thin lines: per-electrode trajectories (within condition)
-%   - Thick line: mean across electrodes
-%   - Shaded band: 95% CI (t-based) or SEM (toggle)
-%   - Points: individual electrodes (jittered) at each cycle
-%
-% Input CSVs:
-%   one or more summary_counts.csv files with header: filename,n_particles
-%
-% Filename examples:
-%   IDEs\3R\E_4_E_4....png
-%   MR\5R\E_2_E_2....png
+% Per cycle, per condition:
+%   - Violin (distribution)
+%   - Box (median + IQR)
+%   - Raw points
+%   - Median ± bootstrap 95% CI (optional)
+% Across cycles:
+%   - Connected median line with markers (evolution)
 
 clear; clc; close all;
 
 %% ---------------- User settings ----------------
-% One or more CSVs to combine (same header: filename,n_particles)
-% Use relative paths or replace with your local data locations.
-CSV_FILES           = { ...
-    fullfile('data', 'summary_counts.csv'), ...
-    fullfile('data', 'IDES_out', 'summary_counts.csv'), ...
-    fullfile('data', 'MR_out', 'summary_counts.csv') ...
+CSV_FILES = { ...
+
 };
 
-% Summary uncertainty on mean bands:
-USE_95CI            = true;     % true: t-based 95% CI; false: SEM
-CI_ALPHA            = 0.05;
+CYCLES_TO_PLOT       = 1:5;
 
-% Figure styling (compact, journal-friendly defaults)
-FONT_NAME           = 'Helvetica';
-FONT_SIZE_AX        = 8;
-FONT_SIZE_LABEL     = 9;
-AX_LINE_W           = 0.9;
+% Variability components
+SHOW_VIOLIN          = true;
+SHOW_BOX             = true;
+SHOW_MEDIAN_CI       = true;
+BOOT_N               = 2000;
+BOX_WHISKER_MODE     = "tukey";  % "tukey" or "minmax"
 
-% Colors (muted, high contrast)
-COL_IDES            = [0.20 0.45 0.70];
-COL_MR              = [0.85 0.45 0.10];
+% Evolution (robust)
+SHOW_EVOLUTION_LINE  = true;     % connect medians across cycles
+EVOL_LINE_W          = 2.0;
+EVOL_MARKER_SIZE     = 4.8;
+
+% Figure styling
+FONT_NAME            = 'Helvetica';
+FONT_SIZE_AX         = 8;
+FONT_SIZE_LABEL      = 9;
+AX_LINE_W            = 0.9;
+
+% Colors
+COL_IDES             = [0.20 0.45 0.70];
+COL_MR               = [0.85 0.45 0.10];
 
 % Raw points
-POINT_SIZE          = 20;
-POINT_ALPHA         = 0.65;
-EDGE_ALPHA          = 0.65;
+POINT_SIZE           = 18;
+POINT_ALPHA          = 0.65;
+EDGE_ALPHA           = 0.55;
+JITTER_FRAC          = 0.22;
 
-% Jitter for raw points (relative to condition separation)
-JITTER_FRAC         = 0.12;
+% Violin style
+VIOLIN_ALPHA         = 0.20;
+VIOLIN_EDGE_ALPHA    = 0.25;
+VIOLIN_MAX_WIDTH     = 0.33;
 
-% Electrode trajectories
-SHOW_TRAJECTORIES   = true;
-TRAJ_ALPHA          = 0.18;
-TRAJ_LINE_W         = 0.9;
+% Box style
+BOX_LINE_W           = 0.9;
+BOX_FACE_ALPHA       = 0.10;
 
-% Mean line + band
-MEAN_LINE_W         = 2.0;
-BAND_ALPHA          = 0.18;
+% Median CI marker style
+CI_LINE_W            = 1.3;
+CI_CAP_W             = 0.08;
 
 % Export
-DO_EXPORT           = false;
-EXPORT_BASENAME     = 'Fig_particles_retained_load_flush_cycles_lines';
+DO_EXPORT            = false;
+EXPORT_BASENAME      = 'Fig_particles_retained_load_flush_cycles_variability_evolution';
 
-% Terminology (single source of truth)
-CYCLE_TERM          = 'load–flush cycle';   % use en-dash
+% Labels
+CYCLE_TERM           = 'load–flush cycle';
+
+rng(1); % deterministic jitter
 
 %% === 0) Read input ======================================================
 if ischar(CSV_FILES) || isstring(CSV_FILES)
@@ -101,9 +104,9 @@ end
 %% === 1) Parse into a table =============================================
 lines = allLines;
 n = numel(lines);
-cond      = strings(n,1);   % "IDEs" or "MR"
-cycleNum  = nan(n,1);       % 1..5 (from \dR)
-electrode = nan(n,1);       % electrode index
+cond      = strings(n,1);
+cycleNum  = nan(n,1);
+electrode = nan(n,1);
 counts    = nan(n,1);
 files     = strings(n,1);
 
@@ -117,6 +120,10 @@ for i = 1:numel(lines)
     fname = strtrim(tok(1));
     val   = str2double(strtrim(tok(2)));
 
+    if ~isfinite(val)
+        continue
+    end
+
     k = k + 1;
     [condK, cycleK, electrodeK] = parseFilename(fname);
     cond(k)      = condK;
@@ -129,17 +136,19 @@ end
 T = table(cond(1:k), cycleNum(1:k), electrode(1:k), counts(1:k), files(1:k), ...
     'VariableNames', {'Condition','Cycle','Electrode','Count','Filename'});
 
-% Consistent ordering for plotting
 condsList = ["IDEs","MR"];
 T.Condition = categorical(string(T.Condition), condsList, 'Ordinal', true);
 
-cycles = (1:5)';
+% cycles
+cyclesPresent = unique(T.Cycle(isfinite(T.Cycle)));
+cycles = intersect(CYCLES_TO_PLOT(:), sort(cyclesPresent(:)))';
+if isempty(cycles)
+    error('No cycles found after parsing. Check filenames / CYCLES_TO_PLOT.');
+end
 
-%% === 2) Aggregate: mean + CI/SEM =======================================
-meanMat = nan(numel(cycles), numel(condsList));
-errMat  = nan(numel(cycles), numel(condsList));   % SEM or CI half-width
-nMat    = nan(numel(cycles), numel(condsList));
+%% === 2) Collect values per group =======================================
 allVals = cell(numel(cycles), numel(condsList));
+nMat    = nan(numel(cycles), numel(condsList));
 
 for ic = 1:numel(cycles)
     cyc = cycles(ic);
@@ -147,36 +156,19 @@ for ic = 1:numel(cycles)
         c = condsList(jc);
         vals = T.Count(T.Cycle==cyc & string(T.Condition)==c);
         vals = vals(:);
-
         allVals{ic,jc} = vals;
-        nMat(ic,jc)    = numel(vals);
-        meanMat(ic,jc) = mean(vals, 'omitnan');
-
-        if numel(vals) >= 2
-            s  = std(vals, 'omitnan');
-            se = s / sqrt(numel(vals));
-            if USE_95CI
-                tcrit = tinv(1 - CI_ALPHA/2, numel(vals)-1);
-                errMat(ic,jc) = tcrit * se;
-            else
-                errMat(ic,jc) = se;
-            end
-        else
-            errMat(ic,jc) = NaN;
-        end
+        nMat(ic,jc) = numel(vals);
     end
 end
 
-%% === 3) Plot (trajectory + mean band) ==================================
-pubWidth  = 3.35;  % inches (single column-ish)
-pubHeight = 2.35;
+%% === 3) Plot ============================================================
+pubWidth  = 3.35;
+pubHeight = 2.60;
 
 fig = figure('Units','inches','Position',[1 1 pubWidth pubHeight], ...
     'Color','w','PaperPositionMode','auto');
-ax = axes('Parent',fig); hold(ax,'on');
-box(ax,'off');
+ax = axes('Parent',fig); hold(ax,'on'); box(ax,'off');
 
-% Axes style
 ax.TickDir   = 'out';
 ax.LineWidth = AX_LINE_W;
 ax.FontName  = FONT_NAME;
@@ -185,150 +177,142 @@ grid(ax,'off');
 
 x = 1:numel(cycles);
 
-% Two-condition x-offset (so IDEs and MR are side-by-side per cycle)
-dx = 0.015;
-xPos = [x(:)-dx, x(:)+dx]; % [IDEs, MR]
+% Two-condition x-offset
+dx = 0.16;
+xPos = [x(:)-dx, x(:)+dx];  % [IDEs, MR]
+dxCond = abs(xPos(1,2)-xPos(1,1));
 
-% --- Shaded uncertainty bands + mean lines ---
-for jc = 1:numel(condsList)
-    c   = condsList(jc);
-    col = pickColor(c, COL_IDES, COL_MR);
+% y-range
+allY = T.Count(isfinite(T.Count));
+if isempty(allY), allY = 1; end
+yMax = max(allY);
+yPad = 0.06 * max(yMax, 1);
 
-    mu  = meanMat(:,jc);
-    ee  = errMat(:,jc);
-
-    % Band polygon (skip if all NaN)
-    if any(isfinite(mu)) && any(isfinite(ee))
-        yLo = mu - ee;
-        yHi = mu + ee;
-
-        % Some cycles may have NaNs: keep fill robust by masking finite
-        msk = isfinite(xPos(:,jc)) & isfinite(yLo) & isfinite(yHi);
-        xx  = xPos(msk,jc);
-        yL  = yLo(msk);
-        yH  = yHi(msk);
-
-        if numel(xx) >= 2
-            hBand = fill(ax, [xx; flipud(xx)], [yL; flipud(yH)], col, ...
-                'FaceAlpha', BAND_ALPHA, 'EdgeColor','none');
-            hBand.Annotation.LegendInformation.IconDisplayStyle = 'off';
-        end
-    end
-
-    % Mean line
-    hMean = plot(ax, xPos(:,jc), mu, '-', 'LineWidth', MEAN_LINE_W, 'Color', col);
-    hMean.Annotation.LegendInformation.IconDisplayStyle = 'on';
-end
-
-% --- Per-electrode trajectories (thin lines) ---
-if SHOW_TRAJECTORIES
+% --- Robust evolution summary (median per cycle) ---
+medMat = nan(numel(cycles), numel(condsList));
+for ic = 1:numel(cycles)
     for jc = 1:numel(condsList)
-        c   = condsList(jc);
-        col = pickColor(c, COL_IDES, COL_MR);
-
-        elecs = unique(T.Electrode(string(T.Condition)==c));
-        for e = elecs(:)'
-            idx = (string(T.Condition)==c) & (T.Electrode==e);
-            cyc = T.Cycle(idx);
-            yy  = T.Count(idx);
-
-            [cycS, order] = sort(cyc);
-            yyS = yy(order);
-
-            % Map cycle numbers to x positions for this condition
-            xLine = xPos(cycS, jc);
-
-            htr = plot(ax, xLine, yyS, '-', 'LineWidth', TRAJ_LINE_W, 'Color', col);
-            try
-                htr.Color(4) = TRAJ_ALPHA; % RGBA alpha (newer MATLAB)
-            catch
-                % older MATLAB: ignore alpha
-            end
-            htr.Annotation.LegendInformation.IconDisplayStyle = 'off';
+        v = allVals{ic,jc};
+        v = v(isfinite(v));
+        if ~isempty(v)
+            medMat(ic,jc) = median(v);
         end
     end
 end
 
-% --- Raw points (jittered) ---
-rng(1); % deterministic jitter
+% --- Draw per group: violin + box + points + median CI ---
 for ic = 1:numel(cycles)
     for jc = 1:numel(condsList)
         vals = allVals{ic,jc};
+        vals = vals(isfinite(vals));
         if isempty(vals), continue; end
 
-        col = pickColor(condsList(jc), COL_IDES, COL_MR);
+        cName = condsList(jc);
+        col = pickColor(cName, COL_IDES, COL_MR);
+        x0  = xPos(ic,jc);
 
-        % jitter amplitude based on the separation between conditions
-        dxCond = abs(xPos(ic,2) - xPos(ic,1));
+        % Violin (behind)
+        if SHOW_VIOLIN && numel(vals) >= 3
+            draw_violin(ax, x0, vals, col, VIOLIN_MAX_WIDTH, VIOLIN_ALPHA, VIOLIN_EDGE_ALPHA);
+        end
+
+        % Box
+        if SHOW_BOX
+            draw_box(ax, x0, vals, col, dxCond*0.42, BOX_LINE_W, BOX_FACE_ALPHA, BOX_WHISKER_MODE);
+        end
+
+        % Raw points
         jitter = (rand(size(vals)) - 0.5) * 2 * (JITTER_FRAC * dxCond);
-
-        xs = xPos(ic,jc) + jitter;
-
+        xs = x0 + jitter;
         hs = scatter(ax, xs, vals, POINT_SIZE, ...
-            'Marker','o', 'MarkerEdgeColor','k', 'LineWidth',0.5, ...
+            'Marker','o', 'MarkerEdgeColor','k', 'LineWidth',0.45, ...
             'MarkerFaceColor', col);
-
         try
             hs.MarkerFaceAlpha = POINT_ALPHA;
             hs.MarkerEdgeAlpha = EDGE_ALPHA;
         catch
         end
         hs.Annotation.LegendInformation.IconDisplayStyle = 'off';
+
+        % Median ± bootstrap CI
+        if SHOW_MEDIAN_CI && numel(vals) >= 3
+            [med, lo, hi] = bootstrap_median_ci(vals, BOOT_N, 0.05);
+            plot(ax, [x0 x0], [lo hi], '-', 'Color', col, 'LineWidth', CI_LINE_W);
+            plot(ax, [x0-CI_CAP_W x0+CI_CAP_W], [lo lo], '-', 'Color', col, 'LineWidth', CI_LINE_W);
+            plot(ax, [x0-CI_CAP_W x0+CI_CAP_W], [hi hi], '-', 'Color', col, 'LineWidth', CI_LINE_W);
+            plot(ax, x0, med, 'o', 'MarkerSize', 4.6, 'MarkerFaceColor', col, 'MarkerEdgeColor','k', 'LineWidth',0.6);
+        end
     end
 end
 
-% Axes labels & ticks
+% --- Evolution line (connect medians) ---
+if SHOW_EVOLUTION_LINE
+    for jc = 1:numel(condsList)
+        col = pickColor(condsList(jc), COL_IDES, COL_MR);
+        mu  = medMat(:,jc);
+        msk = isfinite(mu);
+
+        if nnz(msk) >= 2
+            plot(ax, xPos(msk,jc), mu(msk), '-', 'Color', col, 'LineWidth', EVOL_LINE_W);
+            plot(ax, xPos(msk,jc), mu(msk), 'o', ...
+                'MarkerSize', EVOL_MARKER_SIZE, ...
+                'MarkerFaceColor', col, 'MarkerEdgeColor','k', 'LineWidth',0.6);
+        elseif nnz(msk) == 1
+            plot(ax, xPos(msk,jc), mu(msk), 'o', ...
+                'MarkerSize', EVOL_MARKER_SIZE, ...
+                'MarkerFaceColor', col, 'MarkerEdgeColor','k', 'LineWidth',0.6);
+        end
+    end
+end
+
+% Axes
 ax.XTick      = x;
 ax.XTickLabel = string(cycles);
 
-xlabel(ax, sprintf('%s', CYCLE_TERM), 'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
-ylabel(ax, 'Particles retained (count)',      'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
-title('Optically detected particles',      'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
+xlabel(ax, CYCLE_TERM, 'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
+ylabel(ax, 'Particles retained (count)', 'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
+title(ax, 'Optically detected particles', 'FontName',FONT_NAME, 'FontSize',FONT_SIZE_LABEL);
 
-% Legend: show mean lines only (one per condition)
-lg = legend(ax, {'IDEs','MR'}, 'Location','northoutside', ...
+% Legend (proxy)
+h1 = plot(ax, nan, nan, '-', 'Color', COL_IDES, 'LineWidth', EVOL_LINE_W);
+h2 = plot(ax, nan, nan, '-', 'Color', COL_MR,   'LineWidth', EVOL_LINE_W);
+lg = legend(ax, [h1 h2], {'IDEs','MR'}, 'Location','northoutside', ...
     'Orientation','horizontal', 'Box','off');
 lg.FontName = FONT_NAME;
 lg.FontSize = FONT_SIZE_AX;
 
-% Y limits
-yMax = max([meanMat(:)+errMat(:); T.Count], [], 'omitnan');
-if ~isfinite(yMax), yMax = 1; end
-ylim(ax, [0, 1.08*yMax]);
+ylim(ax, [0, yMax + yPad]);
 ax.YAxis.Exponent = 0;
 
 hold(ax,'off');
 
-%% === 4) Print a stats summary ==========================================
-uncTerm = ternary(USE_95CI, '95% CI', 'SEM');
-
-fprintf('\nSummary (mean ± %s) particles retained per %s:\n', uncTerm, CYCLE_TERM);
+%% === 4) Print a robust summary =========================================
+fprintf('\nRobust summary: median [IQR], n\n');
 for ic = 1:numel(cycles)
-    fprintf('  Cycle %d  IDEs: %.2f ± %.2f (n=%d)  |  MR: %.2f ± %.2f (n=%d)\n', ...
-        cycles(ic), meanMat(ic,1), errMat(ic,1), nMat(ic,1), ...
-        meanMat(ic,2), errMat(ic,2), nMat(ic,2));
+    cyc = cycles(ic);
+    fprintf('Cycle %d:\n', cyc);
+    for jc = 1:numel(condsList)
+        vals = allVals{ic,jc};
+        vals = vals(isfinite(vals));
+        if isempty(vals)
+            fprintf('  %s: (no data)\n', condsList(jc));
+            continue;
+        end
+        q = quantile(vals, [0.25 0.5 0.75]);
+        fprintf('  %s: %.2f [%.2f, %.2f], n=%d\n', condsList(jc), q(2), q(1), q(3), numel(vals));
+    end
 end
 fprintf('\n');
 
 %% === 5) Export ==========================================================
 if DO_EXPORT
-    set(fig,'Renderer','painters'); % vector output
+    set(fig,'Renderer','painters');
     print(fig, [EXPORT_BASENAME '.pdf'], '-dpdf', '-r600');
     print(fig, [EXPORT_BASENAME '.png'], '-dpng', '-r600');
     fprintf('Exported: %s.pdf and %s.png\n', EXPORT_BASENAME, EXPORT_BASENAME);
 end
 
-%% === Caption text suggestion (paste into manuscript) =====================
-% Particles retained on IDEs and microrails (MR) after successive
-% loading–flush cycles. Thin lines show per-electrode trajectories; points
-% show individual observations. Thick lines show the mean per cycle with a
-% shaded band indicating mean ± 95% CI across electrodes.
-
 %% ---- helpers -----------------------------------------------------------
-function out = ternary(cond, a, b)
-if cond, out = a; else, out = b; end
-end
-
 function col = pickColor(condName, colIDEs, colMR)
 if string(condName) == "IDEs"
     col = colIDEs;
@@ -338,10 +322,8 @@ end
 end
 
 function [condOut, cycleOut, electrodeOut] = parseFilename(fname)
-% Robustly parse condition (IDEs/MR), cycle (1..), and electrode (E#)
 f = replace(string(fname), '/', '\');
 
-% Condition: IDEs or MR anywhere in path/filename
 condToken = regexp(f, '(IDEs|MR)', 'match', 'once', 'ignorecase');
 if isempty(condToken)
     error('Cannot parse condition (IDEs/MR) from filename: %s', fname);
@@ -352,7 +334,6 @@ else
     condOut = "IDEs";
 end
 
-% Cycle: prefer folder like "\1R\"; fallback to "_R1_"
 m = regexp(f, '(^|[\\/])(\d+)R([\\/])', 'tokens', 'once');
 if ~isempty(m)
     cycleOut = str2double(m{2});
@@ -367,7 +348,6 @@ else
     cycleOut = str2double(m{1});
 end
 
-% Electrode: prefer "E_#_E_#"; fallback to "E_#" or "E#"
 m = regexp(f, 'E_(\d+)_E_\1', 'tokens', 'once');
 if isempty(m)
     m = regexp(f, 'E_(\d+)', 'tokens', 'once');
@@ -379,4 +359,92 @@ if isempty(m)
     error('Cannot parse electrode from filename: %s', fname);
 end
 electrodeOut = str2double(m{1});
+end
+
+function draw_violin(ax, x0, vals, col, maxWidth, faceAlpha, edgeAlpha)
+vals = vals(isfinite(vals));
+if numel(vals) < 3
+    return;
+end
+
+try
+    [f, y] = ksdensity(vals, 'Function','pdf');
+catch
+    [f, y] = ksdensity(vals);
+end
+
+if all(~isfinite(f)) || max(f) <= 0
+    return;
+end
+
+f = f / max(f);
+w = maxWidth * f;
+
+xL = x0 - w(:);
+xR = x0 + w(:);
+xx = [xL; flipud(xR)];
+yy = [y(:); flipud(y(:))];
+
+h = fill(ax, xx, yy, col, 'FaceAlpha', faceAlpha, 'EdgeColor', col, 'LineWidth', 0.6);
+try
+    h.EdgeAlpha = edgeAlpha;
+catch
+end
+h.Annotation.LegendInformation.IconDisplayStyle = 'off';
+end
+
+function draw_box(ax, x0, vals, col, boxWidth, lineW, faceAlpha, whiskerMode)
+vals = vals(isfinite(vals));
+if isempty(vals)
+    return;
+end
+
+q = quantile(vals, [0.25 0.5 0.75]);
+q1 = q(1); med = q(2); q3 = q(3);
+iqrV = q3 - q1;
+
+switch string(whiskerMode)
+    case "minmax"
+        wLo = min(vals);
+        wHi = max(vals);
+    otherwise % tukey
+        wLo = max(min(vals), q1 - 1.5*iqrV);
+        wHi = min(max(vals), q3 + 1.5*iqrV);
+end
+
+x1 = x0 - boxWidth/2;
+x2 = x0 + boxWidth/2;
+
+hb = fill(ax, [x1 x2 x2 x1], [q1 q1 q3 q3], col, ...
+    'FaceAlpha', faceAlpha, 'EdgeColor','k', 'LineWidth', lineW);
+hb.Annotation.LegendInformation.IconDisplayStyle = 'off';
+
+plot(ax, [x1 x2], [med med], '-', 'Color','k', 'LineWidth', 1.2);
+
+plot(ax, [x0 x0], [wLo q1], '-', 'Color','k', 'LineWidth', lineW);
+plot(ax, [x0 x0], [q3 wHi], '-', 'Color','k', 'LineWidth', lineW);
+
+capW = boxWidth*0.45;
+plot(ax, [x0-capW x0+capW], [wLo wLo], '-', 'Color','k', 'LineWidth', lineW);
+plot(ax, [x0-capW x0+capW], [wHi wHi], '-', 'Color','k', 'LineWidth', lineW);
+end
+
+function [med, lo, hi] = bootstrap_median_ci(vals, B, alpha)
+vals = vals(isfinite(vals));
+n = numel(vals);
+med = median(vals);
+
+if n < 3
+    lo = NaN; hi = NaN;
+    return;
+end
+
+bootMed = nan(B,1);
+for b = 1:B
+    idx = randi(n, n, 1);
+    bootMed(b) = median(vals(idx));
+end
+
+lo = quantile(bootMed, alpha/2);
+hi = quantile(bootMed, 1 - alpha/2);
 end
